@@ -57,7 +57,7 @@ def build_encoded_images(image_paths: List[str]) -> List[Dict[str, Any]]:
 # from openai import OpenAI
 # from image_utils import build_encoded_images
 #
-# client = OpenAI(base_url="http://pluto/v1", api_key="local")
+# client = OpenAI(base_url="https://YOUR_VLM_ENDPOINT/v1", api_key="YOUR_API_KEY")
 #
 # encoded_images = build_encoded_images(["slide1.jpg", "slide2.png"])
 #
@@ -81,7 +81,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("images", nargs="*", help="Image paths to encode")
     parser.add_argument("--model", default=None)
-    parser.add_argument("--base-url", default=os.environ.get("OPENAI_API_BASE", "http://pluto/v1"))
+    parser.add_argument("--base-url", default=os.environ.get("OPENAI_API_BASE", "https://YOUR_VLM_ENDPOINT/v1"))
     parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY"))
     parser.add_argument("--prompt", default=DEFAULT_AML_DIAGNOSIS_PROMPT)
     args = parser.parse_args()

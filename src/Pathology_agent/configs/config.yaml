@@ -68,7 +68,7 @@ tools:
     # Unified cache directory for all embeddings, tiles, and reference indices.
     # Will use subdirectories: feature_cache/ and reference_hnsw/
     # Empty falls back to `./outputs/_cache`
-    CACHE_ROOT_DIR: "/results/agent_runs/aml_gemma4_embedding_suite/_cache"
+    CACHE_ROOT_DIR: "./outputs/_cache"
 
   candidates:
     # Raw ROI candidates kept per view before view-level post-processing.

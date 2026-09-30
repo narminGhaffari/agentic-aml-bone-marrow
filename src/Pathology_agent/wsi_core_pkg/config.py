@@ -45,11 +45,11 @@ def _path_cfg(key: str, section: str, default: str) -> str:
 
 # ---------- model / API ----------
 
-DEFAULT_SLIDE_PATH = _path_cfg("DEFAULT_SLIDE_PATH", "agent", "341476.svs")
+DEFAULT_SLIDE_PATH = _path_cfg("DEFAULT_SLIDE_PATH", "agent", "/data/private/wsi/example_slide.svs")
 MODEL_NAME = _cfg("MODEL_NAME", "agent", "GLM-4.6V-FP8")
 
-_api_key = _cfg("OPENAI_API_KEY", "agent", "local")
-_api_base = _cfg("OPENAI_API_BASE", "agent", "http://pluto/v1")
+_api_key = _cfg("OPENAI_API_KEY", "agent", "YOUR_API_KEY")
+_api_base = _cfg("OPENAI_API_BASE", "agent", "https://YOUR_VLM_ENDPOINT/v1")
 
 client_async = AsyncOpenAI(api_key=_api_key, base_url=_api_base, max_retries=6, timeout=120.0)
 client_sync = OpenAI(api_key=_api_key, base_url=_api_base, max_retries=6, timeout=120.0)
