@@ -1,0 +1,937 @@
+"""Lightning wrapper around the model"""
+
+import inspect
+from abc import ABC
+from collections.abc import Iterable, Sequence
+from typing import Any, TypeAlias
+
+import lightning
+import numpy as np
+import torch
+
+# Use beartype.typing.Mapping to avoid PEP-585 deprecation warnings in beartype
+from beartype.typing import Mapping
+from jaxtyping import Bool, Float
+from lifelines.utils import concordance_index as lifelines_cindex
+from packaging.version import Version
+from torch import Tensor, nn, optim
+from torchmetrics.classification import MulticlassAUROC
+
+import stamp
+from stamp.modeling.models.barspoon import (
+    EncDecTransformer,
+    LitMilClassificationMixin,
+    TargetLabel,
+)
+from stamp.modeling.models.cox import neg_partial_log_likelihood
+from stamp.types import (
+    Bags,
+    BagSizes,
+    Category,
+    CoordinatesBatch,
+    EncodedTargets,
+    PandasLabel,
+    PatientId,
+)
+
+__author__ = "Minh Duc Nguyen"
+__copyright__ = "Copyright (C) 2025 Minh Duc Nguyen"
+__license__ = "MIT"
+
+Loss: TypeAlias = Float[Tensor, ""]
+
+
+class Base(lightning.LightningModule, ABC):
+    """
+    PyTorch Lightning wrapper for tile level and patient level clasification/regression.
+
+    - Compatibility checks based on the `stamp` framework version.
+
+    Args:
+        total_steps: Number of steps done in the LR Scheduler cycle.
+        max_lr: max learning rate.
+        div_factor: Determines the initial learning rate via initial_lr = max_lr/div_factor
+        train_patients: List of patient IDs used for training.
+        valid_patients: List of patient IDs used for validation.
+        stamp_version: Version of the `stamp` framework used during training.
+        **metadata: Additional metadata to store with the model.
+    """
+
+    def __init__(
+        self,
+        *,
+        # Learning Rate Scheduler params, not used in inference
+        total_steps: int,
+        max_lr: float,
+        div_factor: float,
+        # Metadata used by other parts of stamp, but not by the model itself
+        train_patients: Iterable[PatientId],
+        valid_patients: Iterable[PatientId],
+        stamp_version: Version = Version(stamp.__version__),
+        # Other metadata
+        **metadata,
+    ) -> None:
+        super().__init__()
+
+        # LR scheduler config
+        self.total_steps = total_steps
+        self.max_lr = max_lr
+        self.div_factor = div_factor
+
+        # Deployment
+        self.train_patients = train_patients
+        self.valid_patients = valid_patients
+        self.stamp_version = str(stamp_version)
+
+        _ = metadata  # unused here, but saved in model
+
+        # Check if version is compatible.
+        # This should only happen when the model is loaded,
+        # otherwise the default value will make these checks pass.
+        # TODO: Change this on version change
+        if stamp_version < Version("2.5.0"):
+            # Update this as we change our model in incompatible ways!
+            raise ValueError(
+                f"model has been built with stamp version {stamp_version} "
+                f"which is incompatible with the current version."
+            )
+        elif stamp_version > Version(stamp.__version__):
+            # Let's be strict with models "from the future",
+            # better fail deadly than have broken results.
+            raise ValueError(
+                "model has been built with a stamp version newer than the installed one "
+                f"({stamp_version} > {stamp.__version__}). "
+                "Please upgrade stamp to a compatible version."
+            )
+
+        supported_features = getattr(self, "supported_features", None)
+        if supported_features is not None:
+            self.hparams["supported_features"] = supported_features[0]
+        self.save_hyperparameters()
+
+    @staticmethod
+    def _get_model_params(model_class: type[nn.Module], metadata: dict) -> dict:
+        keys = [
+            k for k in inspect.signature(model_class.__init__).parameters if k != "self"
+        ]
+        return {k: v for k, v in metadata.items() if k in keys}
+
+    def _build_backbone(
+        self,
+        model_class: type[nn.Module],
+        dim_input: int,
+        dim_output: int,
+        metadata: dict,
+    ) -> nn.Module:
+        params = self._get_model_params(model_class, metadata)
+        return model_class(
+            dim_input=dim_input,
+            dim_output=dim_output,
+            **params,
+        )
+
+    def configure_optimizers(self):
+        optimizer = optim.AdamW(self.parameters(), lr=1e-3)
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer=optimizer,
+            total_steps=self.total_steps,
+            max_lr=self.max_lr,
+            div_factor=self.div_factor,
+        )
+        return [optimizer], [scheduler]
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        current_lr = self.trainer.optimizers[0].param_groups[0]["lr"]
+        self.log(
+            "learning_rate",
+            current_lr,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=True,
+        )
+
+
+class _TileLevelMixin:
+    """Mixin for tile-level models providing shared MIL masking logic."""
+
+    @staticmethod
+    def _mask_from_bags(bags: Bags, bag_sizes: BagSizes) -> Bool[Tensor, "batch tile"]:
+        """Create attention mask for padded tiles in variable-length bags."""
+        max_possible_bag_size = bags.size(1)
+        mask = torch.arange(max_possible_bag_size).type_as(bag_sizes).unsqueeze(
+            0
+        ).repeat(len(bags), 1) >= bag_sizes.unsqueeze(1)
+        return mask
+
+
+class LitBaseClassifier(Base):
+    """
+    PyTorch Lightning wrapper for tile level and patient level clasification.
+
+    This class encapsulates training, validation, testing, and prediction logic, along with:
+    - Masking logic that ensures only valid tiles (patches) participate in attention during training (deactivated)
+    - AUROC metric tracking during validation for multiclass classification.
+    - Integration of class imbalance handling through weighted cross-entropy loss.
+
+    The attention mask is currently deactivated to reduce memory usage.
+
+    Args:
+        model_class: model backbone
+        categories: List of class labels.
+        ground_truth_label: Column name for accessing ground-truth labels from metadata.
+        category_weights: Class weights for cross-entropy loss to handle imbalance.
+        dim_input: Input feature dimensionality per tile.
+    """
+
+    def __init__(
+        self,
+        *,
+        model_class: type[nn.Module],
+        ground_truth_label: PandasLabel,
+        categories: Sequence[Category],
+        category_weights: Float[Tensor, "category_weight"],  # noqa: F821
+        dim_input: int,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            model_class=model_class,
+            ground_truth_label=ground_truth_label,
+            categories=categories,
+            category_weights=category_weights,
+            dim_input=dim_input,
+            **kwargs,
+        )
+        self.ground_truth_label = ground_truth_label
+
+        if len(categories) != len(category_weights):
+            raise ValueError(
+                "the number of category weights has to match the number of categories!"
+            )
+
+        self.model: nn.Module = self._build_backbone(
+            model_class, dim_input, len(categories), kwargs
+        )
+
+        self.class_weights = category_weights
+        self.valid_auroc = MulticlassAUROC(len(categories))
+        # Number classes
+        self.categories = list(categories)
+
+        self.hparams.update({"task": "classification"})
+
+
+class LitTileClassifier(_TileLevelMixin, LitBaseClassifier):
+    """
+    PyTorch Lightning wrapper for tile-level MIL classification.
+
+    Used in weakly supervised settings for whole-slide images or patch-based data.
+    """
+
+    supported_features = ["tile"]
+
+    def forward(
+        self,
+        bags: Bags,
+    ) -> Float[Tensor, "batch logit"]:
+        return self.model(bags)
+
+    def _step(
+        self,
+        *,
+        batch: tuple[Bags, CoordinatesBatch, BagSizes, EncodedTargets] | list[Tensor],
+        step_name: str,
+        use_mask: bool,
+    ) -> Loss:
+        bags, coords, bag_sizes, targets = batch
+
+        mask = (
+            self._mask_from_bags(bags=bags, bag_sizes=bag_sizes) if use_mask else None
+        )
+
+        logits = self.model(bags, coords=coords, mask=mask)
+
+        loss = nn.functional.cross_entropy(
+            logits,
+            targets.type_as(logits),
+            weight=self.class_weights.type_as(logits),
+        )
+
+        self.log(
+            f"{step_name}_loss",
+            loss,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=True,
+        )
+
+        if step_name == "validation":
+            self.valid_auroc.update(logits, targets.long().argmax(dim=-1))
+            self.log(
+                f"{step_name}_auroc",
+                self.valid_auroc,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+            )
+
+        return loss
+
+    def training_step(
+        self,
+        batch: tuple[Bags, CoordinatesBatch, BagSizes, EncodedTargets] | list[Tensor],
+        batch_idx: int,
+    ) -> Loss:
+        return self._step(batch=batch, step_name="training", use_mask=False)
+
+    def validation_step(
+        self,
+        batch: tuple[Bags, CoordinatesBatch, BagSizes, EncodedTargets] | list[Tensor],
+        batch_idx: int,
+    ) -> Loss:
+        return self._step(batch=batch, step_name="validation", use_mask=False)
+
+    def test_step(
+        self,
+        batch: tuple[Bags, CoordinatesBatch, BagSizes, EncodedTargets] | list[Tensor],
+        batch_idx: int,
+    ) -> Loss:
+        return self._step(batch=batch, step_name="test", use_mask=False)
+
+    def predict_step(
+        self,
+        batch: tuple[Bags, CoordinatesBatch, BagSizes, EncodedTargets] | list[Tensor],
+        batch_idx: int,
+    ) -> Float[Tensor, "batch logit"]:
+        bags, coords, bag_sizes, _ = batch
+        # adding a mask here will *drastically* and *unbearably* increase memory usage
+        # Ensure input dtype matches model weights to avoid dtype-mismatch errors
+        param_dtype = next(self.model.parameters()).dtype
+        bags = bags.to(dtype=param_dtype)
+        coords = coords.to(dtype=param_dtype)
+        return self.model(bags, coords=coords, mask=None)
+
+
+class LitSlideClassifier(LitBaseClassifier):
+    """PyTorch Lightning wrapper for slide/patient-level classification."""
+
+    supported_features = ["slide"]
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.model(x)
+
+    def _step(
+        self, batch: tuple[Tensor, Tensor] | list[Tensor], step_name: str
+    ) -> Loss:
+        feats, targets = list(batch)  # Works for both tuple and list
+        logits = self.model(feats.float())
+        loss = nn.functional.cross_entropy(
+            logits,
+            targets.type_as(logits),
+            weight=self.class_weights.type_as(logits),
+        )
+        self.log(
+            f"{step_name}_loss",
+            loss,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=True,
+        )
+        if step_name == "validation":
+            self.valid_auroc.update(logits, targets.long().argmax(dim=-1))
+            self.log(
+                f"{step_name}_auroc",
+                self.valid_auroc,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=True,
+            )
+        return loss
+
+    def training_step(
+        self, batch: tuple[Tensor, Tensor] | list[Tensor], batch_idx: int
+    ) -> Loss:
+        return self._step(batch, "training")
+
+    def validation_step(
+        self, batch: tuple[Tensor, Tensor] | list[Tensor], batch_idx: int
+    ) -> Loss:
+        return self._step(batch, "validation")
+
+    def test_step(
+        self, batch: tuple[Tensor, Tensor] | list[Tensor], batch_idx: int
+    ) -> Loss:
+        return self._step(batch, "test")
+
+    def predict_step(
+        self, batch: tuple[Tensor, Tensor] | list[Tensor], batch_idx: int
+    ) -> Tensor:
+        feats, _ = batch if isinstance(batch, tuple) else batch
+        # Cast inputs to model parameter dtype to avoid Half/Float mismatches
+        param_dtype = next(self.model.parameters()).dtype
+        feats = feats.to(dtype=param_dtype)
+        return self.model(feats)
+
+
+class LitPatientClassifier(LitSlideClassifier):
+    """
+    PyTorch Lightning wrapper for patient-level classification.
+    Specialization of LitSlideClassifier for patient-level features.
+    """
+
+    supported_features = ["patient"]
+
+
+class LitBaseRegressor(Base):
+    """
+    PyTorch Lightning wrapper for tile-level / patient-level regression.
+
+    Adds a selectable loss:
+      - 'l1' : mean absolute error
+      - 'cc' : correlation-coefficient loss = 1 - Pearson r
+
+    Args:
+        dim_input: Input feature dimensionality per tile.
+        model_clas: Model backbone
+        loss_type: 'l1'.
+    """
+
+    def __init__(
+        self,
+        *,
+        dim_input: int,
+        model_class: type[nn.Module],
+        ground_truth_label: PandasLabel | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            dim_input=dim_input,
+            model_class=model_class,
+            ground_truth_label=ground_truth_label,
+            **kwargs,
+        )
+
+        self.model: nn.Module = self._build_backbone(model_class, dim_input, 1, kwargs)
+        self.ground_truth_label = ground_truth_label
+        self.hparams.update({"task": "regression"})
+
+    @staticmethod
+    def _compute_loss(y_true: Tensor, y_pred: Tensor) -> Loss:
+        return nn.functional.l1_loss(y_true, y_pred)
+
+
+class LitTileRegressor(_TileLevelMixin, LitBaseRegressor):
+    """
+    PyTorch Lightning wrapper for tile-level MIL regression.
+
+    Produces a single continuous output per bag (dim_output = 1).
+    """
+
+    supported_features = ["tile"]
+
+    def forward(
+        self,
+        bags: Bags,
+        coords: CoordinatesBatch | None = None,
+        mask: Bool[Tensor, "batch tile"] | None = None,
+    ) -> Float[Tensor, "batch 1"]:
+        # Mirror the classifier’s call signature to the backbone
+        # (most ViT backbones accept coords/mask even if unused)
+        return self.model(bags, coords=coords, mask=mask)
+
+    def _step(
+        self,
+        *,
+        batch: tuple[Bags, CoordinatesBatch, BagSizes, EncodedTargets] | list[Tensor],
+        step_name: str,
+        use_mask: bool,
+    ) -> Loss:
+        bags, coords, bag_sizes, targets = batch
+
+        mask = (
+            self._mask_from_bags(bags=bags, bag_sizes=bag_sizes) if use_mask else None
+        )
+
+        preds = self.model(bags, coords=coords, mask=mask)  # (B, 1) preferred
+        # Ensure numeric/dtype/shape compatibility
+        y = targets.to(preds).float()
+
+        loss = self._compute_loss(preds, y)
+        self.log(
+            f"{step_name}_loss",
+            loss,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=True,
+        )
+
+        if step_name == "validation":
+            # Optional regression metrics from base (MAE/MSE/Pearson)
+            p = preds.squeeze(-1)
+            t = y.squeeze(-1)
+            self.log(
+                "validation_loss",
+                torch.nn.functional.l1_loss(p, t),
+                prog_bar=True,
+                on_epoch=True,
+                sync_dist=True,
+            )
+
+        return loss
+
+    def training_step(
+        self,
+        batch: tuple[Bags, CoordinatesBatch, BagSizes, EncodedTargets] | list[Tensor],
+        batch_idx: int,
+    ) -> Loss:
+        return self._step(batch=batch, step_name="training", use_mask=False)
+
+    def validation_step(
+        self,
+        batch: tuple[Bags, CoordinatesBatch, BagSizes, EncodedTargets] | list[Tensor],
+        batch_idx: int,
+    ) -> Loss:
+        return self._step(batch=batch, step_name="validation", use_mask=False)
+
+    def test_step(
+        self,
+        batch: tuple[Bags, CoordinatesBatch, BagSizes, EncodedTargets] | list[Tensor],
+        batch_idx: int,
+    ) -> Loss:
+        return self._step(batch=batch, step_name="test", use_mask=False)
+
+    def predict_step(
+        self,
+        batch: tuple[Bags, CoordinatesBatch, BagSizes, EncodedTargets] | list[Tensor],
+        batch_idx: int,
+    ) -> Float[Tensor, "batch 1"]:
+        bags, coords, bag_sizes, _ = batch
+        # keep memory usage low as in classifier
+        return self.model(bags, coords=coords, mask=None)
+
+
+class LitSlideRegressor(LitBaseRegressor):
+    """PyTorch Lightning wrapper for slide/patient-level regression."""
+
+    supported_features = ["slide"]
+
+    def forward(self, feats: Tensor) -> Tensor:
+        return self.model(feats.float())
+
+    def _step(
+        self,
+        *,
+        batch: tuple[Tensor, Tensor] | list[Tensor],
+        step_name: str,
+    ) -> Loss:
+        feats, targets = list(batch)  # Works for both tuple and list
+
+        preds = self.model(feats.float(), mask=None)  # (B, 1)
+        y = targets.to(preds).float()
+
+        loss = self._compute_loss(preds, y)
+
+        self.log(
+            f"{step_name}_loss",
+            loss,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=True,
+        )
+
+        if step_name == "validation":
+            p = preds.squeeze(-1)
+            t = y.squeeze(-1)
+            self.log(
+                "validation_mae",
+                torch.nn.functional.l1_loss(p, t),
+                prog_bar=True,
+                on_epoch=True,
+                sync_dist=True,
+            )
+
+        return loss
+
+    def training_step(
+        self, batch: tuple[Tensor, Tensor] | list[Tensor], batch_idx: int
+    ) -> Loss:
+        return self._step(batch=batch, step_name="training")
+
+    def validation_step(
+        self, batch: tuple[Tensor, Tensor] | list[Tensor], batch_idx: int
+    ) -> Loss:
+        return self._step(batch=batch, step_name="validation")
+
+    def test_step(
+        self, batch: tuple[Tensor, Tensor] | list[Tensor], batch_idx: int
+    ) -> Loss:
+        return self._step(batch=batch, step_name="test")
+
+    def predict_step(
+        self, batch: tuple[Tensor, Tensor] | list[Tensor], batch_idx: int
+    ) -> Tensor:
+        feats, _ = batch if isinstance(batch, tuple) else batch
+        return self.model(feats.float())
+
+
+class LitPatientRegressor(LitSlideRegressor):
+    """
+    PyTorch Lightning wrapper for patient-level regression.
+    Specialization of LitSlideRegressor for patient-level features.
+    """
+
+    supported_features = ["patient"]
+
+
+class LitSurvivalBase(Base):
+    """
+    PyTorch Lightning module for survival analysis with Cox proportional hazards loss.
+    """
+
+    def __init__(
+        self,
+        dim_input: int,
+        model_class: type[nn.Module],
+        time_label: PandasLabel,
+        status_label: PandasLabel,
+        method: str = "cox",
+        **kwargs,
+    ):
+        super().__init__(
+            dim_input=dim_input,
+            model_class=model_class,
+            time_label=time_label,
+            status_label=status_label,
+            **kwargs,
+        )
+        self.model: nn.Module = self._build_backbone(model_class, dim_input, 1, kwargs)
+        self.hparams.update({"task": "survival"})
+        self.method = method
+        self.time_label = time_label
+        self.status_label = status_label
+        # storage for validation accumulation
+        self._val_scores, self._val_times, self._val_events, self._train_scores = (
+            [],
+            [],
+            [],
+            [],
+        )
+        self.train_pred_median = None
+
+    @staticmethod
+    def cox_loss(
+        scores: torch.Tensor, times: torch.Tensor, events: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Breslow negative partial log-likelihood.
+        scores: (N,) risk scores (higher = riskier)
+        times:  (N,) survival/censoring times
+        events: (N,) 1=event, 0=censored
+        """
+        scores = scores.flatten()
+        events = events.bool().flatten()
+        times = times.flatten()
+
+        # event times and indices
+        if not events.any():
+            return scores.sum() * 0.0  # keep graph
+
+        t_event = times[events]  # (R,)
+        # risk set mask: j is at risk for event i if T_j >= T_i
+        # (use >= per standard Cox; vectorized broadcast)
+        risk_mask = t_event[:, None] <= times[None, :]  # (R, N)
+
+        # log-sum-exp over risk sets for numerical stability
+        # log sum_j exp(score_j) for each event i
+        max_scores = scores.max()  # stability
+        lse = (
+            torch.log((risk_mask * torch.exp(scores - max_scores)).sum(dim=1))
+            + max_scores
+        )  # (R,)
+
+        # sum over events: s_i - log sum_{j in R_i} exp(s_j)
+        loglik = scores[events] - lse
+        npll = -loglik.mean()  # mean reduction
+        return npll
+
+    @staticmethod
+    def c_index(
+        scores: torch.Tensor, times: torch.Tensor, events: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Concordance index using lifelines implementation for consistency with statistics.
+
+        Uses the same convention as stamp.statistics.survival:
+        - Higher risk scores should correspond to shorter survival (worse outcome).
+        - We negate scores so lifelines interprets higher values as longer survival.
+        """
+        # Convert to numpy for lifelines
+        scores_np = scores.detach().cpu().numpy().flatten()
+        times_np = times.detach().cpu().numpy().flatten()
+        events_np = events.detach().cpu().numpy().flatten()
+
+        # Filter out NaN values
+        valid_mask = ~(np.isnan(times_np) | np.isnan(events_np) | np.isnan(scores_np))
+        if valid_mask.sum() <= 1:
+            return torch.tensor(float("nan"), device=scores.device)
+
+        times_np = times_np[valid_mask]
+        events_np = events_np[valid_mask]
+        scores_np = scores_np[valid_mask]
+
+        # Use lifelines concordance_index with negated risk (same as statistics module)
+        # lifelines expects: higher predicted value = longer survival
+        # Cox outputs: higher risk = shorter survival, so we negate
+        try:
+            ci = lifelines_cindex(times_np, -scores_np, events_np)
+        except Exception:
+            return torch.tensor(float("nan"), device=scores.device)
+
+        return torch.tensor(ci, device=scores.device, dtype=scores.dtype)
+
+    def on_validation_epoch_end(self):
+        if (
+            len(self._val_scores) == 0
+            or sum(e.sum().item() for e in self._val_events) == 0
+        ):
+            return
+
+        scores = torch.cat(self._val_scores).to(self.device)
+        times = torch.cat(self._val_times).to(self.device)
+        events = torch.cat(self._val_events).to(self.device)
+
+        val_loss = self.cox_loss(scores, times, events)
+        val_ci = self.c_index(scores, times, events)
+
+        self.log("val_cox_loss", val_loss, prog_bar=True, sync_dist=True)
+        self.log("val_cindex", val_ci, prog_bar=True, sync_dist=True)
+
+        self._val_scores.clear()
+        self._val_times.clear()
+        self._val_events.clear()
+
+    def on_train_epoch_end(self):
+        if len(self._train_scores) > 0:
+            all_preds = torch.cat(self._train_scores)
+            self.train_pred_median = all_preds.median().item()
+            self.log(
+                "train_pred_median",
+                self.train_pred_median,
+                prog_bar=True,
+                sync_dist=True,
+            )
+            self._train_scores.clear()
+            self.hparams.update({"train_pred_median": self.train_pred_median})
+
+
+class LitTileSurvival(_TileLevelMixin, LitSurvivalBase):
+    """
+    Tile-level survival analysis with Cox proportional hazards loss.
+
+    Expects batches: (bags, coords, bag_sizes, targets)
+    where targets.shape = (B, 2): [:,0]=time, [:,1]=event (0=censored, 1=event).
+    """
+
+    supported_features = ["tile"]
+
+    def forward(
+        self,
+        bags: Bags,
+        coords: CoordinatesBatch | None = None,
+        mask: Bool[Tensor, "batch tile"] | None = None,
+    ) -> Float[Tensor, "batch 1"]:
+        # Mirror the classifier’s call signature to the backbone
+        # (most ViT backbones accept coords/mask even if unused)
+        return self.model(bags, coords=coords, mask=mask)
+
+    def training_step(
+        self,
+        batch: tuple[Bags, CoordinatesBatch, BagSizes, EncodedTargets] | list[Tensor],
+        batch_idx: int,
+    ) -> Loss:
+        bags, coords, bag_sizes, targets = batch
+        preds = self.model(bags, coords=coords, mask=None)
+        y = targets.to(preds.device, dtype=torch.float32)
+        times, events = y[:, 0], y[:, 1]
+
+        preds = preds.squeeze(-1)  # (B,)
+
+        # save predictions (detach to avoid GPU buildup)
+        self._train_scores.append(preds.detach().cpu())
+
+        loss = neg_partial_log_likelihood(preds, times, events)
+
+        self.log(
+            "train_cox_loss",
+            loss,
+            prog_bar=True,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+        )
+        return loss
+
+    def validation_step(
+        self,
+        batch: tuple[Bags, CoordinatesBatch, BagSizes, EncodedTargets] | list[Tensor],
+        batch_idx: int,
+    ) -> Any:
+        bags, coords, bag_sizes, targets = batch
+        preds = self.model(bags, coords=coords, mask=None).squeeze(-1)
+
+        y = targets.to(preds.device, dtype=torch.float32)
+        times, events = y[:, 0], y[:, 1]
+
+        # accumulate on CPU to save GPU memory
+        self._val_scores.append(preds.detach().cpu())
+        self._val_times.append(times.detach().cpu())
+        self._val_events.append(events.detach().cpu())
+
+    def predict_step(
+        self,
+        batch: tuple[Bags, CoordinatesBatch, BagSizes, EncodedTargets] | list[Tensor],
+        batch_idx: int,
+    ) -> Float[Tensor, "batch 1"]:
+        bags, coords, bag_sizes, survival_target = batch
+        return self.model(bags, coords=coords, mask=None)
+
+
+class LitSlideSurvival(LitSurvivalBase):
+    """
+    Slide-level or patient-level survival analysis.
+    Inherits Cox loss, C-index, and validation logic from LitTileSurvival,
+    but overrides data unpacking to handle (feats, targets) batches.
+    """
+
+    supported_features = ["slide"]
+
+    def training_step(self, batch, batch_idx):
+        feats, targets = batch
+        preds = self.model(feats.float(), mask=None).squeeze(-1)
+
+        y = targets.to(preds.device, dtype=torch.float32)
+        times, events = y[:, 0], y[:, 1]
+
+        self._train_scores.append(preds.detach().cpu())
+        loss = self.cox_loss(preds, times, events)
+
+        self.log(
+            "train_cox_loss",
+            loss,
+            prog_bar=True,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+        )
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        feats, targets = batch
+        preds = self.model(feats.float()).squeeze(-1)
+
+        y = targets.to(preds.device, dtype=torch.float32)
+        times, events = y[:, 0], y[:, 1]
+
+        self._val_scores.append(preds.detach().cpu())
+        self._val_times.append(times.detach().cpu())
+        self._val_events.append(events.detach().cpu())
+
+    def predict_step(self, batch, batch_idx):
+        feats, _ = batch
+        return self.model(feats.float())
+
+
+class LitPatientSurvival(LitSlideSurvival):
+    """
+    PyTorch Lightning wrapper for patient-level classification.
+    Specialization of LitSlideClassifier for patient-level features.
+    """
+
+    supported_features = ["patient"]
+
+
+class LitEncDecTransformer(LitMilClassificationMixin):
+    def __init__(
+        self,
+        *,
+        dim_input: int,
+        category_weights: Mapping[TargetLabel, torch.Tensor],
+        model_class: type[nn.Module] | None = None,
+        ground_truth_label: PandasLabel | Sequence[PandasLabel] | None,
+        categories: Mapping[str, Sequence[Category]],
+        # Model parameters
+        d_model: int = 512,
+        num_encoder_heads: int = 8,
+        num_decoder_heads: int = 8,
+        num_encoder_layers: int = 2,
+        num_decoder_layers: int = 2,
+        dim_feedforward: int = 2048,
+        positional_encoding: bool = True,
+        # Other hparams
+        learning_rate: float = 1e-4,
+        # Deployment metadata (optional) — keep parity with `Base`
+        train_patients: Iterable[PatientId] = (),
+        valid_patients: Iterable[PatientId] = (),
+        stamp_version: Version = Version(stamp.__version__),
+        **hparams: Any,
+    ) -> None:
+        weights_dict: dict[TargetLabel, torch.Tensor] = dict(category_weights)
+        super().__init__(
+            weights=weights_dict,
+            learning_rate=learning_rate,
+        )
+        _ = hparams  # so we don't get unused parameter warnings
+
+        self.model = EncDecTransformer(
+            d_features=dim_input,
+            target_n_outs={t: len(w) for t, w in category_weights.items()},
+            d_model=d_model,
+            num_encoder_heads=num_encoder_heads,
+            num_decoder_heads=num_decoder_heads,
+            num_encoder_layers=num_encoder_layers,
+            num_decoder_layers=num_decoder_layers,
+            dim_feedforward=dim_feedforward,
+            positional_encoding=positional_encoding,
+        )
+
+        self.hparams["supported_features"] = "tile"
+        self.hparams.update({"task": "classification"})
+        # ---- Normalize categories into strict mapping[str, list[str]] ----
+        if not isinstance(categories, Mapping):
+            raise ValueError(
+                "Multi-target classification requires categories as Mapping[str, Sequence[str]]."
+            )
+
+        normalized_categories: dict[str, list[str]] = {
+            str(k): list(v) for k, v in categories.items()
+        }
+
+        # Sanity check: head size must match category size
+        for t, w in category_weights.items():
+            if t not in normalized_categories:
+                raise ValueError(f"Missing categories for target '{t}'")
+            if len(normalized_categories[t]) != len(w):
+                raise ValueError(
+                    f"Category mismatch for target '{t}': "
+                    f"{len(normalized_categories[t])} categories "
+                    f"but head has {len(w)} outputs."
+                )
+
+        self.ground_truth_label = ground_truth_label
+        self.categories = normalized_categories
+
+        # Deployment metadata — mirror `Base` behavior so checkpoints include
+        # train/valid patient lists and stamp version for leak-detection and
+        # compatibility checks.
+        self.train_patients = train_patients
+        self.valid_patients = valid_patients
+        self.stamp_version = str(stamp_version)
+
+        self.save_hyperparameters()
+
+    def forward(self, *args):
+        return self.model(*args)

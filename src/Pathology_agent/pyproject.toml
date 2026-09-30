@@ -1,0 +1,38 @@
+[project]
+name = "slide-agent"
+version = "0.1.0"
+description = "WSI"
+requires-python = ">=3.10"
+
+dependencies = [
+    "fastapi",
+    "python-dotenv",
+    "PyYAML>=6.0",
+    "uvicorn[standard]",
+    "openslide-python",
+    "openslide-bin",
+    "scikit-image",
+    "openai",
+    "openai-agents",
+    "huggingface_hub>=0.32.0",
+    "torch>=2.10.0",
+    "timm>=1.0.25",
+    "jaxtyping>=0.3.7",
+    "hnswlib>=0.8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "httpx",
+    "ruff",
+    "black",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+exclude = ["static", "outputs", "Selected_Tiles"]

@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local environments
+.env
+*.env
+
+# Outputs and private/generated artifacts
+results/
+outputs/
+Experimnes/
+Experiments/
+Output_Error_Files/
+logs/
+*.log
+
+# Protected clinical data and derived patient-level data
+data/private/
+Metadata/
+ROIs_tiff/
+manual_rois/
+*.svs
+*.ndpi
+*.tif
+*.tiff
+*.h5
+*.hdf5
+*.xlsx
+*.xls
+
+# Secrets and keys
+*key*.json
+*secret*
+*.pem
+
+# Figures and large generated media
+*.png
+*.jpg
+*.jpeg
+*.pdf
+*.svg
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/

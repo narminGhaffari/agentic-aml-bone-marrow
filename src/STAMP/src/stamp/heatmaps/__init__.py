@@ -1,0 +1,762 @@
+from __future__ import annotations
+
+import os
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+import logging
+from collections.abc import Collection, Iterable
+from pathlib import Path
+from typing import List, Optional, Tuple, cast
+
+import h5py
+import matplotlib.pyplot as plt
+import numpy as np
+import openslide
+import torch
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
+from matplotlib.patches import Patch
+from packaging.version import Version
+from PIL import Image
+from torch import Tensor
+from torch.func import jacrev
+
+from stamp.modeling.data import get_coords, get_stride
+from stamp.modeling.deploy import load_model_from_ckpt
+from stamp.preprocessing import supported_extensions
+from stamp.preprocessing.tiling import get_slide_mpp_
+from stamp.types import DeviceLikeType, Microns, SlideMPP, TilePixels
+
+_logger = logging.getLogger("stamp")
+
+_SlideLike = openslide.OpenSlide | openslide.ImageSlide
+
+
+def _gradcam_per_category(
+    model: torch.nn.Module,
+    feats: Tensor,
+    coords: Tensor,
+) -> Tensor:
+    feat_dim = -1
+
+    jac = cast(
+        Tensor,
+        jacrev(
+            lambda bags: model.forward(
+                bags.unsqueeze(0),
+                coords=coords.unsqueeze(0),
+                mask=None,
+            ).squeeze(0)
+        )(feats),
+    )
+
+    cam = (feats * jac).mean(feat_dim).abs()
+    cam = torch.softmax(cam, dim=-1)
+    return cam.permute(-1, -2)
+
+
+def _attention_rollout_single(
+    model: torch.nn.Module,
+    feats: Tensor,
+    coords: Tensor,
+) -> Tensor:
+    """
+    Attention rollout for regression/survival models.
+    Aggregates CLS→tile attention across all transformer layers.
+    Returns a 1D relevance map [tile], same shape as _gradcam_single.
+    """
+
+    device = feats.device
+
+    # --- 1. Forward pass to fill attn_weights in each SelfAttention layer ---
+    _ = model(
+        bags=feats.unsqueeze(0),
+        coords=coords.unsqueeze(0),
+        mask=torch.zeros(1, len(feats), dtype=torch.bool, device=device),
+    )
+
+    # --- 2. Rollout computation ---
+    attn_rollout: Optional[torch.Tensor] = None
+    transformer = getattr(model, "transformer", None)
+    if transformer is None:
+        raise RuntimeError("Model does not have a transformer attribute")
+    for layer in transformer.layers:
+        attn = getattr(layer, "attn_weights", None)
+        if attn is None:
+            first_child = next(iter(layer.children()), None)
+            if first_child is not None:
+                attn = getattr(first_child, "attn_weights", None)
+        if attn is None:
+            raise RuntimeError(
+                "SelfAttention.attn_weights not found. "
+                "Make sure SelfAttention stores them on the layer or its first child."
+            )
+
+        # attn: [heads, seq, seq]
+        attn = attn.mean(0)  # → [seq, seq]
+        attn = attn / (attn.sum(dim=-1, keepdim=True) + 1e-8)  # normalize rows
+
+        attn_rollout = attn if attn_rollout is None else attn_rollout @ attn
+
+    if attn_rollout is None:
+        raise RuntimeError("No attention maps collected from transformer layers.")
+
+    # --- 3. Extract CLS → tiles attention ---
+    cls_attn = attn_rollout[0, 1:]  # [tile]
+
+    # --- 4. Normalize for visualization consistency ---
+    cls_attn = cls_attn - cls_attn.min()
+    cls_attn = cls_attn / (cls_attn.max().clamp(min=1e-8))
+
+    return cls_attn
+
+
+def _gradcam_single(
+    model: torch.nn.Module,
+    feats: Tensor,
+    coords: Tensor,
+) -> Tensor:
+    """
+    Grad-CAM-like relevance for regression/survival models using Jacobian-based
+    mechanism (same math as classification but single-output case).
+    """
+    feat_dim = -1
+
+    jac = cast(
+        Tensor,
+        jacrev(
+            lambda bags: model.forward(
+                bags.unsqueeze(0),
+                coords=coords.unsqueeze(0),
+                mask=None,
+            ).squeeze()
+        )(feats),
+    )
+
+    cam = (feats * jac).mean(feat_dim).abs()  # [tile]
+
+    return cam
+
+
+def _vals_to_im(
+    scores: Tensor,
+    coords_norm: Tensor,
+) -> Tensor:
+    """Arranges scores in a 2d grid according to coordinates"""
+    size = coords_norm.max(0).values.flip(0) + 1
+    im = torch.zeros((*size.tolist(), *scores.shape[1:])).type_as(scores)
+
+    flattened_im = im.flatten(end_dim=1)
+    flattened_coords = coords_norm[:, 1] * im.shape[1] + coords_norm[:, 0]
+    flattened_im[flattened_coords] = scores
+
+    im = flattened_im.reshape_as(im)
+
+    return im
+
+
+def _show_thumb(
+    slide: _SlideLike,
+    thumb_ax: Axes,
+    attention: Tensor,
+    default_slide_mpp: SlideMPP | None,
+) -> np.ndarray:
+    mpp = get_slide_mpp_(slide, default_mpp=default_slide_mpp)
+    dims_um = np.array(slide.dimensions) * mpp
+    thumb_size = tuple(np.round(dims_um * 8 / 256).astype(int).tolist())
+    thumb = slide.get_thumbnail(thumb_size)
+    thumb_ax.imshow(np.array(thumb)[: attention.shape[0] * 8, : attention.shape[1] * 8])
+    return np.array(thumb)[: attention.shape[0] * 8, : attention.shape[1] * 8]
+
+
+def _get_thumb_array(
+    slide: _SlideLike,
+    attention: torch.Tensor,
+    default_slide_mpp: SlideMPP | None,
+) -> np.ndarray:
+    """
+    Return a cropped thumbnail as a NumPy array without plotting.
+    Use this instead of _show_thumb() when no Axes object is available.
+    """
+    mpp = get_slide_mpp_(slide, default_mpp=default_slide_mpp)
+    dims_um = np.array(slide.dimensions) * mpp
+    thumb_size = tuple(np.round(dims_um * 8 / 256).astype(int).tolist())
+    thumb = np.array(slide.get_thumbnail(thumb_size))
+    thumb_crop = thumb[: attention.shape[0] * 8, : attention.shape[1] * 8]
+    return thumb_crop
+
+
+def _export_ranked_tiles(
+    *,
+    slide: _SlideLike,
+    tiles_dir: Path,
+    stem: str,
+    label: str,
+    tile_scores: Tensor,
+    coords_tile_slide_px: Tensor,
+    tile_size_slide_px: TilePixels,
+    topk: int,
+    bottomk: int,
+) -> None:
+    """Save the highest- and lowest-scoring tiles for a slide."""
+    scores = tile_scores.detach().flatten().cpu()
+    if scores.numel() == 0:
+        return
+
+    def _save_tile(*, prefix: str, rank: int, tile_index: int, score: float) -> None:
+        slide.read_region(
+            tuple(coords_tile_slide_px[tile_index].tolist()),
+            0,
+            (tile_size_slide_px, tile_size_slide_px),
+        ).convert("RGB").save(
+            tiles_dir / f"{prefix}_{rank:02d}-{stem}-{label}={score:0.2f}.jpg"
+        )
+
+    top_count = min(topk, scores.numel())
+    if top_count > 0:
+        top_scores, top_indices = scores.topk(top_count)
+        for rank, (score, index) in enumerate(zip(top_scores, top_indices), start=1):
+            _save_tile(
+                prefix="top",
+                rank=rank,
+                tile_index=int(index.item()),
+                score=float(score.item()),
+            )
+
+    bottom_count = min(bottomk, scores.numel())
+    if bottom_count > 0:
+        bottom_scores, bottom_indices = (-scores).topk(bottom_count)
+        for rank, (score, index) in enumerate(
+            zip(bottom_scores, bottom_indices), start=1
+        ):
+            _save_tile(
+                prefix="bottom",
+                rank=rank,
+                tile_index=int(index.item()),
+                score=float((-score).item()),
+            )
+
+
+def _show_class_map(
+    class_ax: Axes,
+    top_score_indices: Tensor,
+    gradcam_2d: Tensor,
+    categories: Collection[str],
+) -> Tuple[np.ndarray, List[Patch]]:
+    """Returns the class map image and legend patches for saving separately"""
+    cmap = plt.get_cmap("Pastel1")
+    classes = cast(np.ndarray, cmap(top_score_indices.cpu().numpy()))
+    classes[..., -1] = (gradcam_2d.sum(-1) > 0).detach().cpu().numpy() * 1.0
+    class_ax.imshow(classes)
+
+    legend_patches = [
+        Patch(facecolor=cmap(i), label=cat) for i, cat in enumerate(categories)
+    ]
+    class_ax.legend(handles=legend_patches)
+
+    return classes, legend_patches
+
+
+def _create_overlay(
+    thumb: np.ndarray,
+    score_im: np.ndarray,
+    alpha: float,
+) -> np.ndarray:
+    """Creates an overlay of the heatmap over the thumbnail."""
+    # Resize score_im to match thumbnail size
+    thumb_height, thumb_width = thumb.shape[:2]
+    score_resized = Image.fromarray(np.uint8(score_im * 255)).resize(
+        (thumb_width, thumb_height), resample=Image.Resampling.NEAREST
+    )
+    score_resized = np.array(score_resized) / 255.0
+
+    # Convert thumbnail to float for blending
+    thumb_float = thumb.astype(float) / 255.0
+
+    # Create overlay where heatmap alpha channel > 0
+    mask = score_resized[..., -1] > 0
+    overlay = thumb_float.copy()
+
+    # Blend heatmap with thumbnail where mask is True
+    overlay[mask] = alpha * score_resized[mask, :3] + (1 - alpha) * thumb_float[mask]
+
+    return (overlay * 255).astype(np.uint8)
+
+
+def _create_plotted_overlay(
+    thumb: np.ndarray,
+    score_im: np.ndarray,
+    category: str,
+    slide_score: float,
+    alpha: float,
+) -> Tuple[Figure, Axes]:
+    """Creates a plotted overlay with title and legend."""
+    overlay = _create_overlay(thumb, score_im, alpha)
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    ax.imshow(overlay)
+    ax.set_title(f"{category} - Slide Score: {slide_score:.3f}", fontsize=16, pad=20)
+    ax.axis("off")
+
+    if category not in {"regression", "survival"}:
+        legend_elements = [
+            Patch(facecolor="red", alpha=0.7, label="Positive"),
+            Patch(facecolor="blue", alpha=0.7, label="Negative"),
+        ]
+        ax.legend(
+            handles=legend_elements, loc="upper right", bbox_to_anchor=(0.98, 0.98)
+        )
+
+    plt.tight_layout()
+    return fig, ax
+
+
+def heatmaps_(
+    *,
+    feature_dir: Path,
+    wsi_dir: Path,
+    checkpoint_path: Path,
+    output_dir: Path,
+    slide_paths: Iterable[Path] | None,
+    device: DeviceLikeType,
+    default_slide_mpp: SlideMPP | None,
+    opacity: float,
+    # top tiles
+    topk: int,
+    bottomk: int,
+) -> None:
+    # Collect slides to generate heatmaps for
+    if slide_paths is not None:
+        wsis_to_process = (wsi_dir / slide for slide in slide_paths)
+    else:
+        wsis_to_process = (
+            p for ext in supported_extensions for p in wsi_dir.glob(f"**/*{ext}")
+        )
+
+    for wsi_path in wsis_to_process:
+        slide: _SlideLike | None = None
+        try:
+            h5_path = feature_dir / wsi_path.with_suffix(".h5").name
+
+            if not h5_path.exists():
+                _logger.info(f"could not find matching h5 file at {h5_path}. Skipping...")
+                continue
+
+            slide_output_dir = output_dir / h5_path.stem
+            # Create organized folder structure
+            plots_dir = slide_output_dir / "plots"
+            raw_dir = slide_output_dir / "raw"
+            tiles_dir = slide_output_dir / "tiles"
+
+            for dir_path in [plots_dir, raw_dir, tiles_dir]:
+                dir_path.mkdir(exist_ok=True, parents=True)
+
+            _logger.info(f"creating heatmaps for {wsi_path.name}")
+
+            slide = openslide.open_slide(wsi_path)
+            slide_mpp = get_slide_mpp_(slide, default_mpp=default_slide_mpp)
+            assert slide_mpp is not None, "could not determine slide MPP"
+
+            with h5py.File(h5_path) as h5:
+                feat_type = h5.attrs.get("feat_type", None)
+                if feat_type is not None and feat_type != "tile":
+                    raise ValueError(
+                        f"Feature file {h5_path} is a slide or patient level feature. Heatmaps are currently supported for tile-level features only."
+                    )
+                feats_np = np.asarray(h5["feats"])
+                feats = torch.from_numpy(feats_np).float().to(device)
+                coords_info = get_coords(h5)
+                coords_um = torch.from_numpy(coords_info.coords_um).float()
+                if coords_um.ndim != 2 or coords_um.shape[0] < 2:
+                    raise ValueError(
+                        f"insufficient tile coordinates for heatmap generation: {coords_um.shape}"
+                    )
+                stride_um = Microns(get_stride(coords_um))
+
+                tile_size_slide_px = TilePixels(
+                    int(round(float(coords_info.tile_size_um) / slide_mpp))
+                )
+
+            # grid coordinates, i.e. the top-left most tile is (0, 0), the one to its right (0, 1) etc.
+            coords_norm = (coords_um / stride_um).round().long()
+
+            # coordinates as used by OpenSlide
+            coords_tile_slide_px = torch.round(coords_um / slide_mpp).long()
+
+            model = load_model_from_ckpt(checkpoint_path).eval()
+
+            # TODO: Update version when a newer model logic breaks heatmaps.
+            stamp_version = str(getattr(model, "stamp_version", ""))
+            if Version(stamp_version) < Version("2.5.0"):
+                raise ValueError(
+                    f"model has been built with stamp version {stamp_version} "
+                    f"which is incompatible with the current version."
+                )
+
+            # Score for the entire slide
+            slide_score = (
+                model.model(
+                    feats.unsqueeze(0),
+                    coords=coords_um.unsqueeze(0),
+                    mask=None,
+                ).squeeze(0)
+                # .softmax(0)
+            )
+
+            match model.hparams["task"]:
+                case "classification":
+                    slide_score = slide_score.softmax(0)
+                    # Find the class with highest probability
+                    highest_prob_class_idx = slide_score.argmax().item()
+
+                    gradcam = _gradcam_per_category(
+                        model=model.model,
+                        feats=feats,
+                        coords=coords_um,
+                    )  # shape: [tile, category]
+                    gradcam_2d = _vals_to_im(
+                        gradcam,
+                        coords_norm,
+                    ).detach()  # shape: [width, height, category]
+
+                    with torch.no_grad():
+                        scores = torch.softmax(
+                            model.model(
+                                feats.unsqueeze(-2),
+                                coords=coords_um.unsqueeze(-2),
+                                mask=torch.zeros(
+                                    len(feats), 1, dtype=torch.bool, device=device
+                                ),
+                            ),
+                            dim=1,
+                        )  # shape: [tile, category]
+                    scores_2d = _vals_to_im(
+                        scores, coords_norm
+                    ).detach()  # shape: [width, height, category]
+
+                    fig, axs = plt.subplots(
+                        nrows=2, ncols=max(2, len(model.categories)), figsize=(12, 8)
+                    )
+
+                    # Generate class map and save it separately
+                    classes_img, legend_patches = _show_class_map(
+                        class_ax=axs[0, 1],
+                        top_score_indices=scores_2d.topk(2).indices[:, :, 0],
+                        gradcam_2d=gradcam_2d,
+                        categories=model.categories,
+                    )
+
+                    # Save class map to raw folder
+                    target_size = np.array(classes_img.shape[:2][::-1]) * 8
+                    Image.fromarray(np.uint8(classes_img * 255)).resize(
+                        tuple(target_size), resample=Image.Resampling.NEAREST
+                    ).save(raw_dir / f"{h5_path.stem}-classmap.png")
+
+                    # Generate overview thumbnail first (moved up)
+                    thumb = _show_thumb(
+                        slide=slide,
+                        thumb_ax=axs[0, 0],
+                        attention=_vals_to_im(
+                            torch.zeros(len(feats), 1).to(
+                                device
+                            ),  # placeholder for initial call
+                            coords_norm,
+                        ).squeeze(-1),
+                        default_slide_mpp=default_slide_mpp,
+                    )
+
+                    attention = None
+                    for ax, (pos_idx, category) in zip(
+                        axs[1, :], enumerate(model.categories)
+                    ):
+                        ax: Axes
+                        top2 = scores.topk(2)
+                        category_support = torch.where(
+                            top2.indices[..., 0] == pos_idx,
+                            scores[..., pos_idx] - top2.values[..., 1],
+                            scores[..., pos_idx] - top2.values[..., 0],
+                        )  # shape: [tile]
+                        assert ((category_support >= -1) & (category_support <= 1)).all()
+
+                        attention = torch.where(
+                            top2.indices[..., 0] == pos_idx,
+                            gradcam[..., pos_idx] / gradcam.max(),
+                            (
+                                others := gradcam[
+                                    ..., list(set(range(len(model.categories))) - {pos_idx})
+                                ]
+                                .max(-1)
+                                .values
+                            )
+                            / others.max(),
+                        )  # shape: [tile]
+
+                        category_score = (
+                            category_support * attention / attention.max()
+                        )  # shape: [tile]
+
+                        score_im = cast(
+                            np.ndarray,
+                            plt.get_cmap("RdBu_r")(
+                                _vals_to_im(
+                                    category_score.unsqueeze(-1) / 2 + 0.5, coords_norm
+                                )
+                                .squeeze(-1)
+                                .cpu()
+                                .detach()
+                                .numpy()
+                            ),
+                        )
+
+                        score_im[..., -1] = (
+                            (
+                                _vals_to_im(attention.unsqueeze(-1), coords_norm).squeeze(
+                                    -1
+                                )
+                                > 0
+                            )
+                            .cpu()
+                            .numpy()
+                        )
+
+                        ax.imshow(score_im)
+                        ax.set_title(f"{category} {slide_score[pos_idx].item():1.2f}")
+                        target_size = np.array(score_im.shape[:2][::-1]) * 8
+
+                        Image.fromarray(np.uint8(score_im * 255)).resize(
+                            tuple(target_size), resample=Image.Resampling.NEAREST
+                        ).save(
+                            raw_dir
+                            / f"{h5_path.stem}-{category}={slide_score[pos_idx]:0.2f}.png"
+                        )
+
+                        overlay = _create_overlay(
+                            thumb=thumb, score_im=score_im, alpha=opacity
+                        )
+                        Image.fromarray(overlay).save(
+                            raw_dir / f"raw-overlay-{h5_path.stem}-{category}.png"
+                        )
+
+                        overlay_fig, overlay_ax = _create_plotted_overlay(
+                            thumb=thumb,
+                            score_im=score_im,
+                            category=category,
+                            slide_score=slide_score[pos_idx].item(),
+                            alpha=opacity,
+                        )
+                        overlay_fig.savefig(
+                            plots_dir / f"overlay-{h5_path.stem}-{category}.png",
+                            dpi=150,
+                            bbox_inches="tight",
+                        )
+                        plt.close(overlay_fig)
+
+                        if pos_idx == highest_prob_class_idx:
+                            _export_ranked_tiles(
+                                slide=slide,
+                                tiles_dir=tiles_dir,
+                                stem=h5_path.stem,
+                                label=category,
+                                tile_scores=category_score,
+                                coords_tile_slide_px=coords_tile_slide_px,
+                                tile_size_slide_px=tile_size_slide_px,
+                                topk=topk,
+                                bottomk=bottomk,
+                            )
+
+                    assert attention is not None, (
+                        "attention should have been set in the for loop above"
+                    )
+
+                    Image.fromarray(thumb).save(raw_dir / f"thumbnail-{h5_path.stem}.png")
+
+                    for ax in axs.ravel():
+                        ax.axis("off")
+
+                    fig.savefig(plots_dir / f"overview-{h5_path.stem}.png")
+                    plt.close(fig)
+
+                case "regression":
+                    slide_score = slide_score.item()
+
+                    gradcam = _gradcam_single(
+                        model=model.model, feats=feats, coords=coords_um
+                    )
+                    tile_relevance = gradcam / gradcam.max().clamp(min=1e-8)
+                    gradcam_2d = _vals_to_im(gradcam, coords_norm).squeeze(-1).detach()
+                    gradcam_2d = (gradcam_2d - gradcam_2d.min()) / (
+                        gradcam_2d.max() - gradcam_2d.min() + 1e-8
+                    )
+
+                    score_im = plt.get_cmap("magma")(
+                        gradcam_2d.cpu().numpy()
+                    )
+                    alpha_mask = _vals_to_im(gradcam, coords_norm).squeeze(-1)
+                    score_im[..., -1] = (alpha_mask > 0).cpu().numpy().astype(np.float32)
+
+                    target_size = np.array(score_im.shape[:2][::-1]) * 8
+                    Image.fromarray(np.uint8(score_im * 255)).resize(
+                        tuple(target_size), resample=Image.Resampling.NEAREST
+                    ).save(raw_dir / f"{h5_path.stem}-heatmap.png")
+
+                    thumb = _get_thumb_array(
+                        slide=slide,
+                        attention=_vals_to_im(torch.zeros(len(feats), 1), coords_norm),
+                        default_slide_mpp=default_slide_mpp,
+                    )
+                    Image.fromarray(thumb).save(raw_dir / f"thumbnail-{h5_path.stem}.png")
+
+                    overlay = _create_overlay(thumb=thumb, score_im=score_im, alpha=opacity)
+                    Image.fromarray(overlay).save(
+                        raw_dir / f"raw-overlay-{h5_path.stem}.png"
+                    )
+
+                    overlay_fig, overlay_ax = _create_plotted_overlay(
+                        thumb=thumb,
+                        score_im=score_im,
+                        category="regression",
+                        slide_score=slide_score,
+                        alpha=opacity,
+                    )
+                    overlay_fig.savefig(
+                        plots_dir / f"overlay-{h5_path.stem}.png",
+                        dpi=300,
+                        bbox_inches="tight",
+                    )
+                    plt.close(overlay_fig)
+
+                    fig, axs = plt.subplots(1, 2, figsize=(12, 6), facecolor="white")
+                    axs[0].imshow(thumb)
+                    axs[0].set_title("Thumbnail")
+                    axs[1].imshow(overlay)
+                    axs[1].set_title(f"Prediction Heatmap ({slide_score:.3f})")
+                    for ax in axs:
+                        ax.axis("off")
+                    fig.savefig(
+                        plots_dir / f"overview-{h5_path.stem}.png",
+                        dpi=300,
+                        bbox_inches="tight",
+                    )
+                    plt.close(fig)
+
+                    _export_ranked_tiles(
+                        slide=slide,
+                        tiles_dir=tiles_dir,
+                        stem=h5_path.stem,
+                        label="regression",
+                        tile_scores=tile_relevance,
+                        coords_tile_slide_px=coords_tile_slide_px,
+                        tile_size_slide_px=tile_size_slide_px,
+                        topk=topk,
+                        bottomk=bottomk,
+                    )
+
+                case "survival":
+                    slide_score = slide_score.item()
+
+                    gradcam = _gradcam_single(
+                        model=model.model, feats=feats, coords=coords_um
+                    )
+                    tile_relevance = gradcam / gradcam.max().clamp(min=1e-8)
+                    gradcam_2d = _vals_to_im(gradcam, coords_norm).squeeze(-1).detach()
+                    gradcam_2d = (gradcam_2d - gradcam_2d.min()) / (
+                        gradcam_2d.max() - gradcam_2d.min() + 1e-8
+                    )
+
+                    if getattr(model.hparams, "train_pred_median", None) is not None:
+                        score_im = plt.get_cmap("RdBu_r")(
+                            (
+                                (gradcam_2d - model.hparams["train_pred_median"])
+                                / (
+                                    2
+                                    * (gradcam_2d - model.hparams["train_pred_median"])
+                                    .abs()
+                                    .amax()
+                                    + 1e-8
+                                )
+                                + 0.5
+                            )
+                            .cpu()
+                            .numpy()
+                        )
+
+                        alpha_mask = _vals_to_im(gradcam, coords_norm).squeeze(-1)
+                        score_im[..., -1] = (
+                            (alpha_mask > 0).cpu().numpy().astype(np.float32)
+                        )
+                    else:
+                        score_im = plt.get_cmap("Reds")(
+                            gradcam_2d.cpu().numpy()
+                        )
+                        alpha_mask = _vals_to_im(gradcam, coords_norm).squeeze(-1)
+                        score_im[..., -1] = (
+                            (alpha_mask > 0).cpu().numpy().astype(np.float32)
+                        )
+
+                    target_size = np.array(score_im.shape[:2][::-1]) * 8
+                    Image.fromarray(np.uint8(score_im * 255)).resize(
+                        tuple(target_size), resample=Image.Resampling.NEAREST
+                    ).save(raw_dir / f"{h5_path.stem}-heatmap.png")
+
+                    thumb = _get_thumb_array(
+                        slide=slide,
+                        attention=_vals_to_im(torch.zeros(len(feats), 1), coords_norm),
+                        default_slide_mpp=default_slide_mpp,
+                    )
+                    Image.fromarray(thumb).save(raw_dir / f"thumbnail-{h5_path.stem}.png")
+
+                    overlay = _create_overlay(thumb=thumb, score_im=score_im, alpha=opacity)
+                    Image.fromarray(overlay).save(
+                        raw_dir / f"raw-overlay-{h5_path.stem}.png"
+                    )
+
+                    overlay_fig, overlay_ax = _create_plotted_overlay(
+                        thumb=thumb,
+                        score_im=score_im,
+                        category="survival",
+                        slide_score=slide_score,
+                        alpha=opacity,
+                    )
+                    overlay_fig.savefig(
+                        plots_dir / f"overlay-{h5_path.stem}.png",
+                        dpi=300,
+                        bbox_inches="tight",
+                    )
+                    plt.close(overlay_fig)
+
+                    fig, axs = plt.subplots(1, 2, figsize=(12, 6), facecolor="white")
+                    axs[0].imshow(thumb)
+                    axs[0].set_title("Thumbnail")
+                    axs[1].imshow(overlay)
+                    axs[1].set_title(f"Prediction Heatmap ({slide_score:.3f})")
+                    for ax in axs:
+                        ax.axis("off")
+                    fig.savefig(
+                        plots_dir / f"overview-{h5_path.stem}.png",
+                        dpi=300,
+                        bbox_inches="tight",
+                    )
+                    plt.close(fig)
+
+                    _export_ranked_tiles(
+                        slide=slide,
+                        tiles_dir=tiles_dir,
+                        stem=h5_path.stem,
+                        label="survival",
+                        tile_scores=tile_relevance,
+                        coords_tile_slide_px=coords_tile_slide_px,
+                        tile_size_slide_px=tile_size_slide_px,
+                        topk=topk,
+                        bottomk=bottomk,
+                    )
+        except Exception:
+            _logger.exception(
+                "failed to create heatmaps for %s; skipping this slide",
+                wsi_path.name,
+            )
+            plt.close("all")
+            continue
+        finally:
+            if slide is not None:
+                slide.close()

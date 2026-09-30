@@ -1,0 +1,16 @@
+name: aml-agent-codeocean
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pandas
+  - numpy
+  - scipy
+  - scikit-learn
+  - matplotlib
+  - seaborn
+  - openpyxl
+  - pillow
+  - pyyaml
+  - pip
+

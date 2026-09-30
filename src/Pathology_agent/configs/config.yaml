@@ -1,0 +1,256 @@
+# Tunable ROI / AML ranking defaults for `tools.py` and `roi_ranker.py`.
+# Edit these values to tune behavior across runs.
+# Any environment variable with the same key still overrides the file value.
+
+agent:
+  # OpenAI-compatible API base URL (local LLM server).
+  OPENAI_API_BASE: "https://YOUR_VLM_ENDPOINT/v1"
+  # API key. Set this through an environment variable or a private config file.
+  OPENAI_API_KEY: "YOUR_API_KEY"
+  # Default model name used by the agent.
+  MODEL_NAME: "gemma-4-31B-it"
+  # Default slide path used when running standalone (not batch).
+  DEFAULT_SLIDE_PATH: "/data/private/wsi/example_slide.svs"
+  # Output root directory for all run artifacts.
+  OUTPUTS_ROOT_DIR: "./outputs"
+  # Root directory for example good/bad tiles used in context injection.
+  EXAMPLE_TILES_ROOT: "./Selected_Tiles"
+  # Root directory for example ROI/Non-ROI images used in context injection.
+  EXAMPLE_ROIS_ROOT: "./Example_ROIs"
+  # Sampling temperature for all WSI agents.
+  WSI_AGENT_TEMPERATURE: 0.0
+  # Set to true to enable vLLM chain-of-thought thinking mode.
+  ENABLE_THINKING: false
+  # Maximum number of agent turns before forced termination.
+  # Shared across VLMs; high enough for slower agent models to complete 5 ROI collection.
+  MAX_TURNS: 140
+  # Maximum image dimension (px) for WSI view renders sent to the agent.
+  MAX_IMG_DIM: 1024
+  # Maximum image dimension (px) for native-resolution views (never sent to agent).
+  MAX_NATIVE_VIEW_DIM: 4096
+  # Tile size in microns used for tile-agent saving and TILE_SIZE_UM references.
+  TILE_SIZE_UM: 256.0
+  # Tile output size in pixels after resizing (used by tile-save agent).
+  TILE_PX: 224
+  # Maximum number of good tiles the tile agent will save per run.P
+  MAX_GOOD_TILES: 200
+  # Maximum number of bad tiles the tile agent will save per run.
+  MAX_BAD_TILES: 50
+  # Maximum number of example tiles or ROIs injected per class per request.
+  EXAMPLE_TILES_MAX_PER_CLASS: 2
+  EXAMPLE_ROIS_MAX_PER_CLASS: 2
+
+shared:
+  aml_quality_support:
+    # Minimum good-reference similarity needed to treat a tile as quality-supported.
+    AML_SUPPORT_GOOD_TOP1_FLOOR: 0.19
+    # Maximum bad-reference similarity still allowed for quality-supported tiles.
+    AML_SUPPORT_BAD_TOP1_CEILING: 0.69
+    # Maximum bad-like probability still allowed for quality-supported tiles.
+    AML_SUPPORT_BAD_LIKE_CEILING: 0.825
+
+tools:
+  slide:
+    # Default MPP used when slide metadata does not expose microns-per-pixel.
+    DEFAULT_MPP_UM: 0.159
+    # Default tile prefilter used by AML batch launchers.
+    TILE_FILTER: "hybrid"
+    # Default tile size passed to AML batch runs.
+    TILE_SIZE_PX: 224
+    # Default embedding batch size passed to AML batch runs.
+    BATCH_SIZE: 512
+    # Default AML ROI side length passed to AML batch runs.
+    ROI_SIZE_PX: 2048
+    # Default agent mode passed to AML batch runs.
+    AGENT: "aml_auto"
+
+  cache:
+    # Unified cache directory for all embeddings, tiles, and reference indices.
+    # Will use subdirectories: feature_cache/ and reference_hnsw/
+    # Empty falls back to `./outputs/_cache`
+    CACHE_ROOT_DIR: "/results/agent_runs/aml_gemma4_embedding_suite/_cache"
+
+  candidates:
+    # Raw ROI candidates kept per view before view-level post-processing.
+    ROI_CANDIDATE_TOP_K: 72
+    # Allow a heuristic fallback candidate set when the learned index returns nothing useful.
+    ROI_CANDIDATE_ALLOW_FALLBACK: true
+    # Hard cap on AML candidates after AML-specific ranking.
+    ROI_CANDIDATE_TOP_K_AML: 40
+    # Minimum spacing between AML candidates, as a multiplier of the final ROI side length.
+    ROI_CANDIDATE_DIVERSITY_RADIUS_MULTIPLIER: 1.5
+    # Radius around opened/accepted ROI regions hidden from future candidate hints.
+    ROI_CANDIDATE_VISITED_RADIUS_MULTIPLIER: 1.25
+    # Worker count used while extracting tile embeddings for the ROI index.
+    ROI_RANKER_MAX_WORKERS: 8
+
+  prefilter:
+    coarse:
+      # Enable coarse prefiltering once this many supertiles are available.
+      ROI_COARSE_PREFILTER_TRIGGER_SUPERTILES: 128
+      # Fraction of supertiles retained by the coarse thumbnail prefilter.
+      ROI_COARSE_PREFILTER_KEEP_RATIO: 0.22
+      # Minimum supertiles retained after coarse prefiltering.
+      ROI_COARSE_PREFILTER_MIN_KEEP_SUPERTILES: 36
+      # Maximum supertiles retained after coarse prefiltering.
+      ROI_COARSE_PREFILTER_MAX_KEEP_SUPERTILES: 56
+
+    quality:
+      # Fraction of tiles retained by the quality prefilter.
+      ROI_QUALITY_PREFILTER_KEEP_RATIO: 0.25
+      # Minimum tiles retained after quality prefiltering.
+      ROI_QUALITY_PREFILTER_MIN_KEEP_TILES: 2
+      # Enable quality prefiltering once at least this many tiles are present.
+      ROI_QUALITY_PREFILTER_TRIGGER_TILES: 8
+      # Random reserve fraction kept to preserve diversity during quality prefiltering.
+      ROI_QUALITY_PREFILTER_RANDOM_RESERVE_RATIO: 0.05
+
+  navigation:
+    # Hard cap on kept ROIs; once reached, navigation should stop immediately.
+    MAX_ACCEPTED_ROIS: 5
+    # Soft AML coverage goal; reaching this count is preferred but not mandatory.
+    TARGET_ACCEPTED_ROIS: 5
+    # Default field width used for the first candidate-inspection jump before ROI marking.
+    CANDIDATE_NAV_FIELD_UM: 600.0
+    # Number of recent view steps checked for repeated movement in the same slide region.
+    SAME_REGION_LOOKBACK_STEPS: 0
+    # Radius multiplier that defines "same region" relative to current view width.
+    SAME_REGION_RADIUS_MULTIPLIER: 1.5
+    # Consecutive same-region steps required before warning about local loops.
+    SAME_REGION_WARNING_STEPS: 1
+    # Tissue-fraction threshold below which a view is treated as mostly empty background.
+    LOW_TISSUE_THRESHOLD: 0.10
+    # Number of recent steps checked for repeated low-tissue views.
+    LOW_TISSUE_LOOKBACK_STEPS: 1
+    # Consecutive low-tissue steps required before forcing an overview reset.
+    LOW_TISSUE_WARNING_STEPS: 1
+
+roi_ranker:
+  core:
+    # Random seed used for stochastic KNN/HNSW helpers inside ROI ranking.
+    ROI_KNN_RANDOM_SEED: 42
+    # Weight for novelty in generic WSI candidate scoring.
+    WSI_W_NOVELTY: 0.55
+    # Weight for centroid distance in generic WSI candidate scoring.
+    WSI_W_CENTROID: 0.40
+    # Percentile used to clip extreme novelty outliers before z-scoring.
+    ROI_NOVELTY_CLIP_PERCENTILE: 97.0
+
+  reference_hnsw:
+    # HNSW `M` value used for AML reference-tile indexing.
+    AML_REFERENCE_HNSW_M: 32
+    # HNSW construction breadth used for AML reference-tile indexing.
+    AML_REFERENCE_HNSW_EF_CONSTRUCTION: 100
+    # HNSW search breadth used for AML reference-tile lookup.
+    AML_REFERENCE_HNSW_EF_SEARCH: 100
+    # Use HNSW acceleration for AML reference lookup when available.
+    AML_REFERENCE_USE_HNSW: true
+    # Cache AML reference embeddings / indices on disk.
+    AML_REFERENCE_EMBEDDING_CACHE: true
+  reference_scoring:
+    # Number of nearest AML reference tiles considered per query tile.
+    AML_REFERENCE_TOP_K: 7
+    # Number of slide tiles each AML reference prototype nominates before merging.
+    AML_REFERENCE_TILES_PER_REF: 32
+    # Query block size for exact AML reference similarity evaluation.
+    AML_REFERENCE_QUERY_BLOCK_ROWS: 1024
+    # Logit scale used when converting AML reference similarities into bad-like likelihood.
+    AML_REFERENCE_LOGIT_SCALE: 3.0
+    # Evidence entries retained per class in AML reference summaries.
+    AML_REFERENCE_EVIDENCE_PER_CLASS: 3
+    # Ignore bad AML references when forming retrieval-based tile judgments.
+    AML_DISABLE_BAD_REFERENCES: true
+    # Hard reject threshold on top-1 bad-reference similarity. >1.0 means this check is effectively disabled.
+    AML_BAD_TOP1_REJECT_THRESHOLD: 1.0
+    # Ambiguous bad-reference similarity threshold that still needs a good/bad gap check.
+    AML_BAD_TOP1_AMBIGUOUS_THRESHOLD: 0.78
+    # Minimum good-minus-bad top-1 similarity gap to avoid ambiguous rejection.
+    AML_GOOD_BAD_TOP1_MIN_GAP: 0.025
+    # Hard reject threshold on bad-like likelihood.
+    AML_BAD_LIKE_REJECT_THRESHOLD: 0.72
+    # Hard reject threshold on bad-margin score.
+    AML_BAD_MARGIN_REJECT_THRESHOLD: -0.075
+    # Margin threshold for labeling a tile as clearly good-like.
+    AML_GOOD_LIKE_MARGIN_THRESHOLD: 0.015
+    # Maximum bad-like likelihood still allowed for clearly good-like tiles.
+    AML_GOOD_LIKE_BAD_LIKELIHOOD_MAX: 0.66
+    # Minimum good-vs-bad top-1 gap for clearly good-like tiles.
+    AML_GOOD_LIKE_TOP1_GAP: 0.02
+    # Bad-like threshold used to flag borderline-bad tiles for extra filtering.
+    AML_BORDERLINE_BAD_LIKELIHOOD: 0.78
+    # Maximum bad-margin for tiles treated as borderline bad.
+    AML_BORDERLINE_BAD_MARGIN_MAX: 0.02
+    # Maximum good-vs-bad top-1 gap for tiles treated as borderline bad.
+    AML_BORDERLINE_BAD_TOP1_GAP: 0.015
+    # Aggregation mode for AML reference retrieval. Supported values: `mean`, `max`, `weighted`.
+    AML_REFERENCE_AGGREGATION: "mean"
+    # Margin below which tiles are hard-rejected by AML quality heuristics.
+    AML_QUALITY_REJECT_MARGIN: 0.02
+
+  dark_region:
+    # Weight of dark-region box prior in AML candidate ranking score.
+    AML_DARK_REGION_BOX_PRIOR_WEIGHT: 0.08
+
+  knn_graph:
+    # HNSW construction breadth used for slide-level novelty KNN search.
+    ROI_KNN_HNSW_EF_CONSTRUCTION: 100
+    # HNSW `M` value used for slide-level novelty KNN search.
+    ROI_KNN_HNSW_M: 32
+    # Minimum HNSW search breadth used for slide-level novelty KNN search.
+    ROI_KNN_HNSW_EF_SEARCH_MIN: 64
+
+  quality_scoring:
+    # Weight for bad-margin evidence in the AML quality prior.
+    AML_QUALITY_PRIOR_BAD_MARGIN_WEIGHT: 0.70
+    # Weight for good-vs-bad similarity gap in the AML quality prior.
+    AML_QUALITY_PRIOR_SIMILARITY_GAP_WEIGHT: 0.30
+    # Baseline where bad-like soft penalty begins to ramp up.
+    AML_BAD_LIKE_SOFT_PENALTY_BASELINE: 0.40
+    # Offset added before scaling the bad-match soft penalty.
+    AML_BAD_MATCH_SOFT_PENALTY_OFFSET: 0.02
+    # Scale used for the bad-match soft penalty ramp.
+    AML_BAD_MATCH_SOFT_PENALTY_SCALE: 0.16
+    # Weight for bad-like soft penalty in total AML quality penalty.
+    AML_QUALITY_PENALTY_BAD_LIKE_WEIGHT: 0.72
+    # Weight for bad-match soft penalty in total AML quality penalty.
+    AML_QUALITY_PENALTY_BAD_MATCH_WEIGHT: 0.28
+    # Hard minimum dark score for AML candidates before percentile filtering.
+    # Keep this permissive: dark/purple is only a candidate cue, not proof of diagnostic quality.
+    AML_ABSOLUTE_MIN_DARK_SCORE: 0.02
+    # Weight for dark-score evidence in final AML candidate ranking.
+    # Lower than quality/readability evidence to avoid selecting crushed stain-heavy purple fields.
+    AML_COMBINED_RANK_DARK_WEIGHT: 0.18
+    # Weight for the base novelty/reference ranking in final AML candidate ranking.
+    AML_COMBINED_RANK_BASE_SCORE_WEIGHT: 0.20
+    # Weight for AML quality prior in final AML candidate ranking.
+    AML_COMBINED_RANK_QUALITY_PRIOR_WEIGHT: 0.26
+    # Penalty weight applied to AML quality penalties in final AML candidate ranking.
+    AML_COMBINED_RANK_QUALITY_PENALTY_WEIGHT: 0.22
+    # Bonus added for tiles with strong good-reference support.
+    AML_COMBINED_RANK_GOOD_SUPPORT_BONUS: 0.06
+    # Tile-size multiplier used to enforce adaptive center spacing between kept ROI candidates.
+    ROI_ADAPTIVE_MIN_SEPARATION_TILE_RATIO: 0.38
+
+aml_pipeline:
+  # Output conventions matching run_batch_aml_suite.sh / evaluate/run_single_slide.py.
+  ROI_IMAGES_SUBDIR: "images"
+  ROI_COLLECTION_FILENAME: "roi_collection.json"
+  ROI_CANDIDATES_FILENAME: "roi_candidates.jpg"
+  SLIDE_OVERVIEW_FILENAME: "slide_overview.jpg"
+
+context_injection:
+  images:
+    # Maximum image dimension (px) when encoding context images as JPEG data URLs.
+    CONTEXT_IMAGE_MAX_DIM: 256
+    # JPEG quality used when encoding context images.
+    CONTEXT_IMAGE_JPEG_QUALITY: 70
+    # Maximum number of inline images included per LLM request.
+    CONTEXT_MAX_INLINE_IMAGES: 2
+    # Maximum total base64 chars for all inline images per LLM request.
+    CONTEXT_MAX_INLINE_IMAGE_URL_CHARS: 90000
+
+  candidates:
+    # Maximum previous-view images included in context per request.
+    CONTEXT_PREVIOUS_VIEWS_MAX: 0
+    # Maximum candidate lines shown to the model per view.
+    CONTEXT_ROI_CANDIDATE_LINES_MAX: 5
