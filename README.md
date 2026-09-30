@@ -28,8 +28,6 @@ The public workflow covers four computational experiment families:
    - Downstream VLM prediction.
    - Downstream STAMP prediction.
 
-The blinded ROI-quality reader study is intentionally not included in this repository workflow.
-
 ## Repository Layout
 
 ```text

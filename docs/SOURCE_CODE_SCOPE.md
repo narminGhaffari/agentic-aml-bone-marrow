@@ -27,7 +27,7 @@ such as `/data/private`, `results`, and `src`.
 1. STAMP on all tiles.
 2. STAMP on manual ROIs.
 3. Standalone VLM diagnosis on manual ROIs.
-4. Agent-selected ROIs with downstream VLM and STAMP prediction.
+4. Agent-selected ROIs with downstream VLM or STAMP prediction.
 
 ## Excluded
 

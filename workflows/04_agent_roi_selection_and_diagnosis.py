@@ -8,7 +8,7 @@ from workflow_common import EXTRACTORS, add_common_args, run_or_plan
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run the agentic ROI-selection workflow and downstream diagnoses."
+        description="Run agentic ROI selection and downstream diagnosis branches."
     )
     add_common_args(parser)
     args = parser.parse_args()
@@ -60,7 +60,7 @@ def main() -> None:
             )
 
     run_or_plan(
-        name="Agent ROI selection plus downstream VLM and STAMP predictions",
+        name="Agent ROI selection plus downstream VLM or STAMP predictions",
         commands=commands,
         execute=args.execute,
         required_paths=[
@@ -71,7 +71,7 @@ def main() -> None:
             (args.data_root / "wsi", "controlled-access WSI directory"),
         ],
         notes=[
-            "This is the main agentic pipeline entry point: WSI -> candidate fields -> accepted ROIs -> VLM and STAMP outputs.",
+            "This is the main agentic pipeline entry point: WSI -> candidate fields -> accepted ROIs -> downstream VLM or STAMP outputs.",
             "Uses the included Pathology_agent source and included STAMP source via PYTHONPATH.",
             "Exact manuscript outputs require private WSIs and VLM/model access.",
         ],

@@ -1,19 +1,27 @@
-# Running Individual Experiments
+# Running Experiments
 
-This repository does not include patient data, WSI files, feature files, model checkpoints, or API keys. Replace the example paths below with controlled-access local paths.
+This repository does not include patient data, WSI files, feature files, model checkpoints, or API keys. Replace the example `/data/private` paths below with your own controlled-access local paths.
 
 All commands are intended to be run from the repository root.
 
-## 1. Agentic ROI Selection For One WSI
+## Single-WSI Agent Modes
 
-This runs only the agentic ROI-selection stage and saves the selected ROIs plus `roi_collection.json`.
+These commands all use the same script, `src/Pathology_agent/evaluate/run_single_slide.py`. The only difference is the value passed to `--agent`.
+
+| Mode | What it does | When to use it |
+| --- | --- | --- |
+| `aml_roi` | Selects ROIs only and saves ROI images plus `roi_collection.json`. | You only want the agent-selected regions from one WSI. |
+| `aml_auto` | Selects ROIs and then runs VLM diagnosis on those ROIs. | You want an agent plus VLM result for one WSI. |
+| `aml_stamp` | Runs STAMP on an existing `roi_collection.json`. | You already selected ROIs with `aml_roi` and now want STAMP prediction on those ROIs. |
+
+Example ROI-selection-only command:
 
 ```bash
 PYTHONPATH=src/Pathology_agent:src/STAMP/src:$PYTHONPATH \
 OPENAI_API_BASE="https://YOUR_VLM_ENDPOINT/v1" \
 OPENAI_API_KEY="YOUR_API_KEY" \
 python src/Pathology_agent/evaluate/run_single_slide.py \
-  --slide /path/to/one_slide.svs \
+  --slide /data/private/wsi/one_slide.svs \
   --output-dir results/single_slide_agent_roi \
   --experiment-root results/single_slide_cache \
   --agent aml_roi \
@@ -27,35 +35,32 @@ python src/Pathology_agent/evaluate/run_single_slide.py \
   --default-mpp-um 0.159
 ```
 
-## 2. Agentic ROI Selection Plus VLM Diagnosis For One WSI
-
-Use the same command, but set:
+To run ROI selection plus VLM diagnosis, use the same command but change:
 
 ```bash
 --agent aml_auto
 ```
 
-This performs ROI selection and then runs VLM diagnosis from the selected ROIs.
-
-## 3. Agentic ROI Selection Plus VLM And STAMP For One WSI
-
-Use:
+To run ROI selection plus STAMP prediction, use two steps. First run ROI selection with `aml_roi`, then run STAMP on the saved `roi_collection.json`:
 
 ```bash
---agent aml_auto_stamp
+PYTHONPATH=src/Pathology_agent:src/STAMP/src:$PYTHONPATH \
+python src/Pathology_agent/evaluate/run_single_slide.py \
+  --slide /data/private/wsi/one_slide.svs \
+  --output-dir results/single_slide_agent_stamp \
+  --experiment-root results/single_slide_cache \
+  --agent aml_stamp \
+  --roi-input-path results/single_slide_agent_roi/one_slide/roi_collection.json \
+  --stamp-train-root /data/private/stamp_train/All_Tiles
 ```
 
-and provide a private STAMP checkpoint root:
+## Cohort-Level Manuscript Experiments
 
-```bash
---stamp-train-root /data/private/stamp_train/All_Tiles
-```
+These wrappers run the four main computational experiment families across a metadata table or cohort. They are not single-slide commands.
 
-This requires trained STAMP checkpoints and the private inputs used for STAMP deployment.
+## STAMP All Tiles
 
-## 4. STAMP On All Tiles
-
-The workflow wrapper runs AML-vs-healthy and NPM1 tasks for UNI2, Virchow2, H-Optimus-1, and DinoBloom.
+This runs STAMP using all available tiles for AML-vs-healthy and NPM1 tasks across the configured feature extractors.
 
 ```bash
 python workflows/01_stamp_all_tiles.py \
@@ -72,9 +77,9 @@ Expected private inputs include:
 /data/private/features/All_Tiles/
 ```
 
-Each STAMP config directory should contain the task-specific `config.yaml` needed by `python -m stamp train` and `python -m stamp deploy`.
+## STAMP Manual ROIs
 
-## 5. STAMP On Manual ROIs
+This runs STAMP using manually annotated ROI tiles.
 
 ```bash
 python workflows/02_stamp_manual_rois.py \
@@ -91,9 +96,9 @@ Expected private inputs include:
 /data/private/features/Manual_ROIs/
 ```
 
-## 6. Standalone VLM Diagnosis On Manual ROIs
+## Standalone VLM On Manual ROIs
 
-The wrapper runs Gemma and Qwen for 5-ROI and 10-ROI settings.
+This runs VLM diagnosis directly on manual ROIs, without the agent ROI-selection step.
 
 ```bash
 VLM_BASE_URL="https://YOUR_VLM_ENDPOINT/v1" \
@@ -114,9 +119,9 @@ Expected private inputs include:
 /data/private/secrets/vlm_api_key.json
 ```
 
-## 7. Agent-Selected ROIs With Downstream VLM And STAMP
+## Agent-Selected ROIs With Downstream VLM Or STAMP
 
-The wrapper runs the agentic pipeline on the test slide table for Gemma/Qwen and the configured feature extractors.
+This is the cohort-level agent-selected ROI experiment. The agentic part is ROI selection; the selected ROIs can then be evaluated with downstream VLM diagnosis or downstream STAMP prediction.
 
 ```bash
 OPENAI_API_BASE="https://YOUR_VLM_ENDPOINT/v1" \
@@ -136,7 +141,7 @@ Expected private inputs include:
 /data/private/stamp_train/
 ```
 
-## 8. Run All Four Experiment Families
+## Run All Four Cohort Experiment Families
 
 ```bash
 OPENAI_API_BASE="https://YOUR_VLM_ENDPOINT/v1" \
@@ -149,4 +154,4 @@ bash workflows/run_experiments.sh \
   --output-dir results
 ```
 
-This command is only meaningful when all controlled-access inputs are available.
+This command runs the four cohort-level wrappers above.
