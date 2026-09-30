@@ -39,7 +39,6 @@ such as `/data/private`, `results`, and `src`.
 - patient-level predictions,
 - manuscript figures,
 - manuscript statistical output tables,
-- blinded ROI-quality reader-study workflows and outputs,
 - local virtual environments, git internals, caches, and generated outputs.
 
 ## What Requires Controlled-Access Data
