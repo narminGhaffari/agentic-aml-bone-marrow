@@ -14,7 +14,7 @@ The repository is code-only. Raw whole-slide images, manual ROI images, extracte
 - 🔎 **Deterministic candidate ranking** using tissue filtering, quality filtering, and pathology foundation-model embeddings.
 - 🧠 **Downstream VLM diagnosis** from selected or manually annotated ROIs.
 - 🧬 **STAMP training/deployment workflows** for all-tile, manual-ROI, and agent-selected ROI settings.
-- 📦 **Executable workflow wrappers** for the four main computational experiment families.
+- 📦 **Separate workflow wrappers** for each main computational experiment family.
 - 📚 **Documentation** for expected private inputs, source-code scope, and individual run commands.
 
 ## 🧪 Experiment Families
@@ -48,7 +48,6 @@ src/
   Prompts/              Prompt templates used by the VLM workflows
 
 workflows/
-  run_experiments.sh    Entry point for the four cohort-level experiment families
   01_stamp_all_tiles.py
   02_stamp_manual_rois.py
   03_vlm_manual_rois.py
@@ -82,20 +81,17 @@ Full execution requires private inputs mounted outside the repository, for examp
 /data/private/secrets/
 ```
 
-Run all four cohort-level experiment families:
+Each experiment is run individually. For example, to run the STAMP all-tile workflow:
 
 ```bash
-OPENAI_API_BASE="https://YOUR_VLM_ENDPOINT/v1" \
-OPENAI_API_KEY="YOUR_API_KEY" \
-VLM_BASE_URL="https://YOUR_VLM_ENDPOINT/v1" \
-VLM_API_KEY_FILE="/data/private/secrets/vlm_api_key.json" \
-bash workflows/run_experiments.sh \
+python workflows/01_stamp_all_tiles.py \
   --project-root src \
   --data-root /data/private \
-  --output-dir results
+  --output-dir results \
+  --execute
 ```
 
-For individual commands, including agentic ROI selection on a single WSI, see [Running Experiments](docs/RUN_EXPERIMENTS.md).
+For the other individual experiment commands, including agentic ROI selection on a single WSI, see [Running Experiments](docs/RUN_EXPERIMENTS.md).
 
 ## 🧭 Single-WSI Agent Modes
 

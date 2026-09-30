@@ -54,9 +54,9 @@ python src/Pathology_agent/evaluate/run_single_slide.py \
   --stamp-train-root /data/private/stamp_train/All_Tiles
 ```
 
-## Cohort-Level Manuscript Experiments
+## Individual Manuscript Experiments
 
-These wrappers run the four main computational experiment families across a metadata table or cohort. They are not single-slide commands.
+These wrappers are intended to be run individually. They are not single-slide commands, and there is no combined "run everything" launcher because the manuscript workflows involve staged training, deployment, validation, and statistics steps.
 
 ## STAMP All Tiles
 
@@ -140,18 +140,3 @@ Expected private inputs include:
 /data/private/wsi/
 /data/private/stamp_train/
 ```
-
-## Run All Four Cohort Experiment Families
-
-```bash
-OPENAI_API_BASE="https://YOUR_VLM_ENDPOINT/v1" \
-OPENAI_API_KEY="YOUR_API_KEY" \
-VLM_BASE_URL="https://YOUR_VLM_ENDPOINT/v1" \
-VLM_API_KEY_FILE="/data/private/secrets/vlm_api_key.json" \
-bash workflows/run_experiments.sh \
-  --project-root src \
-  --data-root /data/private \
-  --output-dir results
-```
-
-This command runs the four cohort-level wrappers above.
